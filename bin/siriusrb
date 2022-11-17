@@ -3,13 +3,4 @@ require "irb"
 load File.expand_path("~/.irbrc") if File.exist?(File.expand_path("~/.irbrc"))
 require "sirius"
 include Sirius
-if __FILE__.sub(/file:/, '').gsub(/ /,'%20') == $0.gsub(/file:/, '').gsub(/ /,'%20')
-  IRB.start(__FILE__)
-else
-  # check -e option
-  if /^-e$/ =~ $0
-    IRB.start(__FILE__)
-  else
-    IRB.setup(__FILE__)
-  end
-end
+IRB.start(__FILE__)

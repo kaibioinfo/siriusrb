@@ -37,6 +37,7 @@ module Sirius
   SILENT = Java::OrgOpenscienceCdkSilent::SilentChemObjectBuilder.getInstance
   java_import "de.unijena.bioinf.ChemistryBase.fp.CdkFingerprintVersion"
   java_import "de.unijena.bioinf.MassDecomposer.Chemistry.DecomposerCache"
+  java_import "de.unijena.bioinf.ChemistryBase.chem.FormulaConstraints"
   DecomposerCacheInstance = DecomposerCache.new(4)
 
   def decompose(mass, ion: "[M+H]+", dev: 10.ppm, elements: "CHNOPS")
@@ -54,19 +55,33 @@ module Sirius
     return str if str.kind_of?(MolecularFormula)
     MolecularFormula.parseOrThrow(str)
   end
+
   def show! xs
+    astable=false
     if xs.kind_of?(Enumerable)
       opts={}
-      ys = xs.map {|x| x._show_molecule(opts)}
+      ys = xs.map {|x| 
+        if !astable && x.respond_to?(:_show_molecule)
+          x._show_molecule(opts)
+        elsif x.kind_of?(Enumerable)
+          astable=true
+          x.map {|y| y._show_molecule(opts)}
+        end
+      }
     else
       opts={}
       ys = [xs._show_molecule(opts)]
+    end
+    if astable
+      opts[:table_layout] = true
     end
     Utils::Depiction.quick_depict_many(ys, opts)
   end
   def Ion(str)
     PrecursorIonType.fromString(str)
   end
+  Protonation = PrecursorIonType.fromString("[M+H]+")
+  Deprotonation = PrecursorIonType.fromString("[M-H]-") 
   def SMARTS(query)
     if query.kind_of?(Java::OrgOpenscienceCdkSmarts::SmartsPattern)
       query
@@ -85,7 +100,9 @@ module Sirius
     when Hash
       inchi = obj[:inchi] || obj["inchi"]
       if inchi
-        Java::OrgOpenscienceCdkInchi::InChIGeneratorFactory.getInstance.getInChIToStructure(inchi, SILENT).getAtomContainer
+        m=Java::OrgOpenscienceCdkInchi::InChIGeneratorFactory.getInstance.getInChIToStructure(inchi, SILENT).getAtomContainer
+        Java::OrgOpenscienceCdkSmarts::SmartsPattern.prepare(m)
+        return m
       elsif obj[:sdf] || obj["sdf"] || obj["file"] || obj[:file]
         nm = obj[:sdf] || obj["sdf"]|| obj["file"] || obj[:file]
         reader=nil
@@ -103,11 +120,14 @@ module Sirius
         end
         chemreader.close
         reader.close
+        xs.each {|x| Java::OrgOpenscienceCdkSmarts::SmartsPattern.prepare(x)}
         return xs
       else
         smi = obj[:smiles] || obj["smiles"]
         if smi
-          Java::OrgOpenscienceCdkSmiles::SmilesParser.new(SILENT).parseSmiles(smi)
+          mol=Java::OrgOpenscienceCdkSmiles::SmilesParser.new(SILENT).parseSmiles(smi)
+          Java::OrgOpenscienceCdkSmarts::SmartsPattern.prepare(mol)
+          mol
         else
           raise "unknown input format #{hash.keys.inspect}"
         end
@@ -116,12 +136,46 @@ module Sirius
       return obj
     end
   end
+  Java::OrgOpenscienceCdkInterfaces::IBond.class_eval do
+    BOND_SYMS = ["-","=","#","?","?","?",":"]
+    def to_s
+      "#{getAtom(0)}#{isAromatic ? BOND_SYMS[6] : BOND_SYMS[getOrder.ordinal]}#{getAtom(1)}"
+    end
+    def inspect
+      to_s
+    end
+  end
+  Java::OrgOpenscienceCdkInterfaces::IAtom.class_eval do
+    def to_s
+      "#{getSymbol}@#{index}"
+    end
+    def inspect
+      "#{getSymbol}@#{index}"
+    end
+    def neighbours
+      bonds.map {|x| x.getOther(self)}
+    end
+  end
+  def FormulaConstraints(str)
+    return FormulaConstraints.fromString(str)
+  end
+  FormulaConstraints.class_eval do
+    def =~ form
+      return isSatisfied(Formula(form),Protonation.ionization)
+    end
+  end
   IAtomContainer.class_eval do
     def to_s
       Java::OrgOpenscienceCdkSmiles::SmilesGenerator.new(Java::OrgOpenscienceCdkSmiles::SmiFlavor::Generic | Java::OrgOpenscienceCdkSmiles::SmiFlavor::UseAromaticSymbols).create(self)
     end
     def inspect
       to_s
+    end
+    def extract_smarts(indizes,level=2)
+      lv = Java::DeUnijenaBioinfFragmenter::SmartsGen::Level.values[level]
+      gen=Java::DeUnijenaBioinfFragmenter::SmartsGen.new(self)
+      gen.setLevel(lv)
+      gen.generate_shortest(indizes)
     end
     def ecfp_fingerprint
       return @ecfp_fingerprint if @ecfp_fingerprint
@@ -137,6 +191,15 @@ module Sirius
       return @maccs_fingerprint if @maccs_fingerprint
       circ = Java::OrgOpenscienceCdkFingerprint::MACCSFingerprinter.new(SILENT)
       @maccs_fingerprint = circ.getBitFingerprint(self).asBitSet()
+    end
+    def formula
+      charge = Java::OrgOpenscienceCdkToolsManipulator::AtomContainerManipulator.getTotalFormalCharge(self)
+      formula = Formula(Java::OrgOpenscienceCdkToolsManipulator::MolecularFormulaManipulator.getString(Java::OrgOpenscienceCdkToolsManipulator::MolecularFormulaManipulator.getMolecularFormula(self)))
+      if charge==0
+        return formula
+      else
+        return formula.add(MolecularFormula.getHydrogen.multiply(charge.to_i))
+      end
     end
 
 
@@ -203,6 +266,15 @@ module Sirius
       end
       return intersection.to_f / union.to_f
     end
+    def matchall(pattern)
+      pat = SMARTS(pattern)
+      res = pat.match_all(self).uniqueAtoms.toArray.to_a
+      if res.empty?
+        return []
+      else
+        return MultiMatch.new(self, res.map {|x| pat}, res)
+      end
+    end
     def =~ pattern
       if (pattern.kind_of?(String))
         pat = SMARTS(pattern)
@@ -264,8 +336,19 @@ module Sirius
     def -@
       negate
     end
+    # warning: this conflicts with the <=> method
+    def <= other
+      other.isSubtractable?(self)
+    end
+    # warning: this conflicts with the <=> method
+    def >= other
+      self.isSubtractable?(other)
+    end
     def [](elem)
       numberOf(elem)
+    end
+    def =~ constr
+      FormulaConstraints(constr) =~ self
     end
   end
   PrecursorIonType.class_eval do
@@ -277,6 +360,17 @@ module Sirius
     end
   end
   class MultiMatch
+    include Enumerable
+    def each
+      @indizes.zip(@patterns).each {|i,p|
+        yield Match.new(@molecule, p, i)
+      }
+    end
+    def to_a
+      @indizes.zip(@patterns).map {|i,p|
+        Match.new(@molecule, p, i)
+      }
+    end
     def initialize(molecule, patterns, indizes)
       @molecule = molecule
       @patterns = patterns
@@ -328,15 +422,25 @@ module Sirius
   end
   class Match
     attr_reader :molecule, :pattern, :indizes
+    attr_accessor :color
     def initialize(molecule, pattern, indizes)
       @molecule = molecule
       @pattern = pattern
       @indizes = indizes
+      @color=:red
+    end
+    def with_color(c)
+      m=Match.new(@molecule,@pattern,@indizes)
+      m.color = c
+      m
     end
     def show!
       opts={}
       m = [_show_molecule(opts)]
       Utils::Depiction.quick_depict_many(m, opts)
+    end
+    def to_smarts(level=2)
+      @molecule.extract_smarts(@indizes, level)
     end
     def _show_molecule(opts)
       chemobjs = Set.new(indizes.map {|i| @molecule.getAtom(i)})
@@ -345,8 +449,8 @@ module Sirius
           chemobjs.add(bond)
         end
       end
-      opts[:red] ||= [] 
-      opts[:red].push(*chemobjs.to_a)
+      opts[@color] ||= [] 
+      opts[@color].push(*chemobjs.to_a)
       opts[:glow] = true
       @molecule
     end
